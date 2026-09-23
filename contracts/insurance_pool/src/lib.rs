@@ -18,10 +18,12 @@
 //! follow-up work needed before mainnet.
 
 mod insurance_interface;
+mod claim_prioritization;
 #[cfg(test)]
 mod test;
 
 pub use insurance_interface::{InsurancePoolInterface, InsurancePoolInterfaceClient};
+pub use claim_prioritization::{PayoutStrategy, PendingClaim, allocate_payouts};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,

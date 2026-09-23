@@ -1,6 +1,6 @@
 # Insurance Pool Design — Default Protection for LPs (Issue #123)
 
-**Status:** Design-forward stub (interface + accounting implemented; economics & token settlement are follow-ups)
+**Status:** Real token settlement implemented (Issue #824); claim payout prioritization added (Issue #825)
 **Crate:** `contracts/insurance_pool`
 
 ## Motivation
@@ -52,20 +52,23 @@ Each proposal overwrites any previously pending proposal of the same kind.
 `iln_governance`) since the timelock itself — not caller identity — is the
 security boundary once a change has been proposed by the admin.
 
-## Stub semantics (what ships here)
+## Implementation status
 
-The stub in `contracts/insurance_pool/src/lib.rs` is a **correct, fully-tested**
-implementation of the interface with intentionally simplified economics:
+The implementation in `contracts/insurance_pool/src/lib.rs` is **fully featured** with both
+token settlement and payout prioritization:
 
-- **Accounting, not custody.** `deposit_premium` records the premium as pool
-  *accounting* balance. A production pool would move SAC tokens into the
-  contract; that token settlement is deliberately out of scope for the stub.
-- **Flat coverage cap.** `claim` pays `min(coverage, pool_balance)`, where
-  `coverage` is a flat per-claim cap set at `initialize`. A production pool
-  would price payouts against the invoice amount, the LP's premium history, and
-  remaining pool solvency.
-- **Idempotency & auth.** Each `invoice_id` can be claimed once; `claim`
-  requires the configured admin (the liquidity contract in production).
+- **Real token settlement (Issue #824).** `deposit_premium` now transfers actual SAC tokens
+  from the LP to the pool contract via `token::Client::transfer()`. Pool balance reflects
+  real custody. Payouts transfer tokens directly to LPs using checks-effects-interactions.
+- **Risk-priced coverage (Issue #528).** Coverage is tiered based on LP's historical
+  premium contributions. Higher-premium LPs get better coverage, incentivizing pool participation.
+- **Claim payout prioritization (Issue #825).** When simultaneous defaults exceed pool balance,
+  payouts are allocated using configurable strategies:
+  - **Pro-Rata**: Proportional to accumulated premiums.
+  - **Risk-Weighted**: Pro-rata adjusted by LP default history.
+  - **FIFO**: First claimant receives full coverage; later claims split remainder.
+- **Idempotency & auth.** Each `invoice_id` can be claimed once; `claim` requires the
+  configured admin (the liquidity contract in production).
 
 Ten interface tests cover initialization, enrollment, premium accumulation,
 coverage-capped vs balance-capped payouts, idempotency, and the empty-pool and
@@ -263,10 +266,15 @@ console.log(`Claim filed for invoice ${invoiceId}: payout ${payout} stroops`);
 
 ---
 
-## Follow-up work (before mainnet)
+## Completed work
 
-- Real SAC token custody for premiums and payouts.
-- Risk-priced premiums and coverage (vs. flat cap).
-- Pool solvency guards and payout prioritization across simultaneous defaults.
-- Governance parameters (premium schedule, coverage ratio).
+- ✅ Real SAC token custody for premiums and payouts (Issue #824).
+- ✅ Risk-priced coverage tiers based on LP premium history (Issue #528).
+- ✅ Payout prioritization across simultaneous defaults (Issue #825).
+
+## Remaining follow-up work (before mainnet)
+
+- Risk-priced premiums based on LP default history (dynamic premium rates).
+- TWAP-based pricing for multi-token settlements (Issue #822, #823).
+- Governance parameter governance contract integration.
 - End-to-end integration tests across `invoice_liquidity` ⇄ `insurance_pool`.
