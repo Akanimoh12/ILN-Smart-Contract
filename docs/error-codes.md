@@ -67,6 +67,11 @@ Source of truth: [`contracts/insurance_pool/src/lib.rs`](../contracts/insurance_
 | 7 | `TimelockNotExpired` | The proposal's timelock has not yet expired. | Attempted to execute a timelocked action before the 3-day delay elapsed. | Wait until `env.ledger().timestamp() >= eta` and retry. |
 | 8 | `ArithmeticOverflow` | A checked arithmetic operation overflowed during premium accumulation. | Depositing an amount that would overflow `i128` on the running balance or per-LP premium counter. | Ensure deposit amounts are within sane bounds; this should only occur with extreme/malicious inputs. |
 | 9 | `BalanceCapExceeded` | Premium deposit would push the pool balance above the configured cap. | The admin has set a `BalanceCap` and the incoming deposit would exceed it. | Reduce the deposit amount or ask the admin to raise the cap via `set_balance_cap`. |
+| 10 | `SolvencyCircuitOpen` | A new claim payout has been paused because the solvency circuit breaker is open. | The pool's reserve ratio fell below `MinReserveRatioBps` (Issue #826) and the sticky breaker tripped. | Governance must restore the reserve and call `reset_solvency_circuit`; enrollments and premium deposits continue unaffected. |
+| 11 | `InvalidReserveRatio` | The minimum reserve ratio (bps) must be within `0..=10_000`. | `set_min_reserve_ratio_bps` / `set_backstop_funding_bps` called with a bps value above 10_000. | Use a value in the valid basis-point range. |
+| 12 | `EvidenceRequired` | A claim gated by the review window was attempted before on-chain evidence was submitted. | `ReviewWindowSeconds > 0` and `submit_claim_evidence` was never called for the invoice (Issue #828). | Submit evidence via `submit_claim_evidence` before claiming, or disable the review gate. |
+| 13 | `ReviewWindowNotElapsed` | A claim gated by the review window was attempted before the window elapsed. | Evidence was submitted but `env.ledger().timestamp()` is still within `submitted_at + ReviewWindowSeconds` (Issue #828). | Retry the claim after the review window elapses. |
+| 14 | `InvalidBackstopAmount` | A backstop top-up was requested with a non-positive amount. | `top_up_backstop` called with `amount <= 0` (Issue #827). | Pass a positive stroop amount. |
 
 ---
 

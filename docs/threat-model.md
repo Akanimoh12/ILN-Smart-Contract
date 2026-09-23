@@ -820,22 +820,21 @@ Members can submit claims on defaults. Without proper verification, a member cou
 - ✅ **Invoice History:** Claims are tied to actual invoice_liquidity defaults (immutable on-chain)
 - ✅ **Admin Review:** Admin can investigate claims and contest fraud
 - ✅ **Payer Reputation:** Payers with low default history are less incentivized to stage defaults
+- ✅ **On-chain Claim Evidence (Issue #828):** `submit_claim_evidence(invoice_id, hash)` attaches an immutable, timestamped digest of the invoice/evidence-of-payment-attempt documentation to every claim, queryable off-chain for auditors
+- ✅ **Opt-in Review Window (Issue #828):** governance can set `set_review_window_seconds(n)` per risk tier so payouts sit for `n` seconds after evidence submission, giving time for dispute/contest before funds move
+- ✅ **Per-pair Default Tracking (Issue #829):** `record_pair_default` + `get_pair_collusion_flag` expose per-(LP, payer) concentration (defaults where one payer dominates a single LP's losses), feeding off-chain fraud detection
 
-**Residual Risk:** ⚠️ **HIGH**
+**Residual Risk:** ⚠️ **MEDIUM**
+- On-chain evidence is a hash only — the underlying documents live off-chain and must be preserved by the submitter
+- Repeated small defaults by the same payer pair are tracked but only *flagged* for review, not automatically rejected
+- Review window and flagging are governance-opt-in; a pool that never enables them retains the automatic flow
 - No cryptographic proof of member legitimacy or payer creditworthiness
-- Admin review is manual and subjective
-- Repeated small defaults by same payer pair may not be detected
-- Pool does not validate that invoice terms are "reasonable" (collusion incentives opaque)
 
 **Recommendation:**
-- **Implement Claims Adjudication:** Require admin or DAO multi-sig approval for large claims (> threshold)
-- **Fraud Detection:** Monitor for patterns:
-  - Same member + same payer submitting multiple defaults in short window
-  - Member submitting claims shortly after enrollment
-  - Payer default rate >> average default rate in system
-- **Claim Dispute Window:** Allow community to dispute claims for X days before payout
-- **Proof of Loss:** Require evidence (invoice, evidence of payment attempt) off-chain
-- **KYC for High-Value Claims:** Require identity verification for claims > pool balance threshold
+- **Adopt the review window** for high-value risk tiers as a dispute/contest buffer (safe with the automatic flow: a gated claim reports `compensated: false` until a follow-up payout after the window)
+- **Wire the collusion flag into monitoring:** alert when `get_pair_collusion_flag` turns true, especially for recently-enrolled LPs
+- **Proof of Loss:** continue requiring evidence (invoice, evidence of payment attempt) off-chain and submit its hash via `submit_claim_evidence`
+- **KYC for High-Value Claims:** require identity verification for claims > pool balance threshold
 
 #### G3. Pool Drainage / Insolvency Risk
 
@@ -857,15 +856,19 @@ The pool accepts claims up to enrolled capacity. If claim frequency exceeds proj
 - ✅ **Funding Mechanism:** Premiums accumulate in pool for payout reserves
 - ✅ **Admin Oversight:** Admin can pause claims or enroll new members if capacity is exceeded
 - ✅ **Transparent Reserves:** On-chain balance is queryable (members can check solvency)
+- ✅ **Solvency Circuit Breaker (Issue #826):** governance-configurable minimum reserve ratio (`set_min_reserve_ratio_bps`); when breached, the breaker trips (`SolvencyCircuitTripped`), **automatically pausing new claim payouts** until an explicit `reset_solvency_circuit`, with enrollments and premium deposits continuing so the pool can be recapitalized
+- ✅ **Capital Backstop (Issue #827):** protocol-owned backstop fund (`top_up_backstop`, optional premium-fee share) extends the reserve available for claims beyond the liquid premium pool — see [ADR-013](adr/ADR-013-capital-backstop.md)
+- ✅ **Reserve Ratio View (Issue #826):** `get_reserve_ratio_bps` + `get_total_reserve` make the pool's solvency against its coverage cap continuously queryable for off-chain monitoring
 
-**Residual Risk:** ⚠️ **HIGH**
-- No automatic trigger to halt enrollment if claims exceed safe reserves
-- Premium rates may be too low to cover expected default rates
-- Pool has no reinsurance mechanism (no capital backstop)
-- Economic incentives misaligned: member wants low premiums, pool needs high premiums for safety
-- No automatic claim rejection or payout reduction if pool depletes
+**Residual Risk:** ⚠️ **MEDIUM**
+- Circuit breaker default is `0` (disabled) — it only engages when governance arms a threshold
+- Backstop is capped by what governance/fees seed it with; it mitigates but does not eliminate insolvency risk
+- Premium rates may still be too low to cover expected default rates
+- No automatic payout *reduction* (the breaker pauses entirely instead); no pro-rata smoothing across simultaneous defaults
 
 **Recommendation:**
+- **Arm the breaker on mainnet** at a target reserve ratio and include `get_reserve_ratio_bps` / `is_solvency_circuit_open` in live monitoring
+- **Seed the backstop** from a protocol fee share and monitor `get_backstop_balance` alongside it
 - **Dynamic Premium Adjustment:** Link premium_rate_bps to pool utilization ratio:
   - If utilization > 80%, increase premiums 10-20% automatically
   - If utilization < 20%, decrease premiums to attract members
@@ -874,8 +877,6 @@ The pool accepts claims up to enrolled capacity. If claim frequency exceeds proj
   - Large claims (>$100k) queued and processed over time
   - First-in-first-out or pro-rata payout if insolvent
 - **Insurance Reserve Requirement:** Admin must maintain minimum reserve (e.g., 50% of enrolled coverage)
-- **Stop-Loss Mechanism:** Auto-pause enrollment if reserves fall below threshold
-- **Reinsurance or Backstop:** Establish partnership with external insurer or maintain DAO treasury reserve
 - **Clear Communication:** Publish pool solvency ratio to members, warn if approaching danger zone
 
 ---

@@ -75,6 +75,57 @@ This document provides data-backed recommendations for the initial configuration
 
 **Conservative Starting Value:** YES — No cap is safer than a cap that's too low.
 
+### 6. Solvency Circuit Breaker Threshold (Recommended) — `min_reserve_ratio_bps`
+
+**Recommended Value:** `1000` bps (10% of the per-claim coverage cap) as a
+trip threshold; `0` (disabled) is the safe pre-governance default.
+
+**Rationale:**
+- On mainnet the pool should be better protected than the liquid-premium-only model of
+  the stub: the breaker pauses **new claim payouts** automatically when the
+  pool's reserve ratio (`(balance + backstop) / coverage`) falls below the
+  threshold (Issue #826).
+- Enrollments and premium deposits are never blocked by the breaker, so it is
+  a *stop-loss* for remaining LPs, not a lock-in: governance restores reserves
+  and calls `reset_solvency_circuit()` to resume.
+- A trip emits `SolvencyCircuitTripped`, which the Week-3/4 review should treat
+  as a **trigger event** for an emergency governance review (see schedule
+  below).
+
+**Conservative Starting Value:** NO default with the breaker armed is
+appropriate to ship today (a fresh pool has near-zero ratio and would be
+permanently stuck); the **decision** is that mainnet governance arms it via
+`set_min_reserve_ratio_bps` before public launch.
+
+### 7. Capital Backstop Funding Share (Recommended) — `backstop_funding_bps`
+
+**Recommended Value:** `0` initially (disabled); protocol funding via
+`top_up_backstop` from a DAO/treasury source. Re-evaluate a fee-share
+(`set_backstop_funding_bps`) after 30 days of data.
+
+**Rationale:**
+- The pool previously had *no* defence in depth beyond premiums
+  ([threat-model G3](threat-model.md#g3-pool-drainage--insolvency-risk)); the
+  backstop (Issue #827, [ADR-013](adr/ADR-013-capital-backstop.md)) adds a
+  dedicated reserve drawn only after liquid balance is exhausted.
+- A `0` default preserves existing deposit behavior; a fee-share does not need
+  to be set until value is proven.
+- `get_backstop_balance()` and `get_total_reserve()` let monitors verify the
+  buffer continuously.
+
+### 8. Claim Review Window (Optional) — `review_window_seconds`
+
+**Recommended Value:** `0` (disabled) initially for the automatic flow; enable
+per risk tier only if fraud patterns warrant a dispute buffer.
+
+**Rationale:**
+- `0` keeps `invoice_liquidity`'s automatic compensation path unchanged
+  (Issue #828).
+- For high-value tiers, governance can set a window (e.g. 86_400s = 1 day) so a
+  claim pays out only after evidence + window elapse. A gated claim reports
+  `compensated: false` until a follow-up payout, so it degrades gracefully
+  without blocking `claim_default`.
+
 ## Governance Proposal Template
 
 Below is a template ready for submission to the governance system:

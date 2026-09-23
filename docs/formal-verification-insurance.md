@@ -100,10 +100,22 @@ currently guarantee:
   #662)](insurance-pool-design.md#aggregate-exposure-invariant-issue-662)
   for the chosen pro-rata policy and the stress test that verifies graceful
   degradation rather than panics or incorrect payouts.
-- **No global reserve ratio.** There is no enforced minimum
-  `pool_balance / enrolled_exposure` ratio; a governance-set `BalanceCap`
-  bounds how large the pool can grow, but nothing bounds how many LPs can
-  enroll against a small balance.
+- **No global reserve ratio enforced by invariant.** There is no *enforced by
+  the formal S1/S2 invariants* minimum `pool_balance / enrolled_exposure`
+  ratio; a governance-set `BalanceCap` bounds how large the pool can grow, but
+  nothing *in the invariants* bounds how many LPs can enroll against a small
+  balance. **Mitigated in product**: a governance-configurable solvency
+  circuit breaker (Issue #826) pauses new claim payouts automatically when
+  `reserve / coverage` falls below `MinReserveRatioBps`, is sticky until an
+  explicit `reset_solvency_circuit()`, and never blocks enrollments/premiums —
+  see [`docs/insurance-pool-design.md`](./insurance-pool-design.md). This is a
+  *policy guard*, not a replacement for the S1/S2 invariants: the protocol
+  still never overpays its own balance, the breaker just adds a solvency floor
+  on top.
+- **Backstop reserves are not invariant-backed.** The capital backstop
+  (Issue #827) is accounting on top of the liquid balance; its draw order
+  (liquid first, then backstop) is behavior, not an additional invariant, and
+  its solvency benefit depends on governance actually funding it.
 - **Premium accounting is per-pool, not per-invoice.** `sum(claims_paid) <=
   sum(premiums_deposited)` (S2) holds pool-wide, not per-LP — a heavy
   claimant can be compensated using premiums another LP deposited. This is

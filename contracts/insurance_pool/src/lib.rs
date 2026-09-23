@@ -30,8 +30,18 @@ pub use insurance_interface::{
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env,
+    Address, BytesN, Env,
 };
+
+/// Minimum defaults on a single (lp, payer) pair before the collusion
+/// heuristic considers the pair worth flagging for off-chain monitoring
+/// (Issue #829).
+pub const MIN_PAIR_DEFAULTS_TO_FLAG: u32 = 3;
+
+/// Minimum fraction (in bps) of an LP's total defaults that must be
+/// attributed to one payer for the collusion heuristic to flag the pair —
+/// i.e. at least 50% of an LP's defaults concentrating on a single payer.
+pub const COLLUSION_PAIR_SHARE_FLAG_BPS: u32 = 5_000;
 
 /// Timelock delay (in seconds) enforced between proposing and executing an
 /// admin action, and before which a proposal may be cancelled (Issue #542).
@@ -65,6 +75,22 @@ pub enum InsuranceError {
     ArithmeticOverflow = 8,
     /// Premium deposit would exceed the configured pool balance cap.
     BalanceCapExceeded = 9,
+    /// A new claim payout has been paused: the pool's reserve ratio is below
+    /// the governance-configured minimum and the solvency circuit breaker is
+    /// open (Issue #826). Only a governance `reset_solvency_circuit` resumes
+    /// payouts.
+    SolvencyCircuitOpen = 10,
+    /// The minimum reserve ratio must be within 0..=10_000 bps (Issue #826).
+    InvalidReserveRatio = 11,
+    /// A claim gated by the review window was attempted before on-chain
+    /// evidence was submitted for the invoice (Issue #828).
+    EvidenceRequired = 12,
+    /// A claim gated by the review window was attempted before the
+    /// governance-configured review window elapsed (Issue #828).
+    ReviewWindowNotElapsed = 13,
+    /// A backstop top-up was requested for an amount exceeding what the
+    /// funding source holds / is invalid (Issue #827).
+    InvalidBackstopAmount = 14,
 }
 
 /// Storage keys for the pool.
@@ -118,6 +144,28 @@ pub enum DataKey {
     /// already tracked for risk-priced premiums (Issue #528), used to
     /// estimate the pool's claim rate.
     TotalDefaultCount,
+    /// Minimum pool reserve ratio (bps, balance vs coverage cap) below
+    /// which new claim payouts are paused (Issue #826).
+    MinReserveRatioBps,
+    /// Whether the solvency circuit breaker is currently open; sticky until
+    /// a governance `reset_solvency_circuit` clears it (Issue #826).
+    SolvencyCircuitOpenFlag,
+    /// Accounting balance held aside as the protocol's capital backstop,
+    /// separate from the liquid claim `Balance` (Issue #827).
+    BackstopBalance,
+    /// Share (bps) of each premium deposit diverted to the backstop fund
+    /// (Issue #827). `0` disables automatic backstop contributions.
+    BackstopFundingBps,
+    /// On-chain evidence hash attached to a claim, plus when it was
+    /// submitted (Issue #828).
+    ClaimEvidence(u64),
+    /// Governance-configurable review window (seconds) that a claim must
+    /// sit in after evidence submission before payout (Issue #828);
+    /// `0` disables the gate.
+    ReviewWindowSeconds,
+    /// Default counter for a specific (lp, payer) pair, the raw data
+    /// surfaced for the collusion heuristic (Issue #829).
+    PairDefaultCount(Address, Address),
 }
 
 /// Solvency snapshot returned by `get_pool_health`, so LPs can judge
@@ -143,6 +191,63 @@ pub struct PoolHealth {
     /// `months_of_coverage_at_current_rate` because Soroban's
     /// `#[contracttype]` caps struct field names at 30 characters.
     pub months_of_coverage: Option<u32>,
+}
+
+/// Payload of the `solvency_tripped` event (Issue #826), emitted when the
+/// governance-configured minimum reserve ratio is breached and new claim
+/// payouts are automatically paused.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SolvencyCircuitTripped {
+    /// Pool reserve ratio (bps, balance vs coverage cap) at the moment of
+    /// the trip. Always below the configured `MinReserveRatioBps`.
+    pub ratio_bps: u32,
+    /// Liquid reserve (pool `Balance`) observed at the trip.
+    pub reserve: i128,
+}
+
+/// Payload of the `solvency_reset` event (Issue #826), emitted when a
+/// governance action resumes claim payouts after a circuit trip.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SolvencyCircuitReset {
+    /// Reserve ratio at the moment of the reset.
+    pub ratio_bps: u32,
+    /// Liquid reserve (pool `Balance`) observed at the reset.
+    pub reserve: i128,
+}
+
+/// On-chain evidence attached to a defaulted invoice's claim (Issue #828).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimEvidence {
+    /// Hash (32 bytes) of the off-chain fraud/legitimacy documentation
+    /// (invoice, evidence of payment attempt) backing this claim.
+    pub evidence_hash: BytesN<32>,
+    /// Ledger timestamp at which the evidence was submitted.
+    pub submitted_at: u64,
+}
+
+/// Payload of the `pair_default_recorded` event (Issue #829), surfacing
+/// per-(lp, payer) pair default counts for the off-chain collusion
+/// detector.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairDefaultRecorded {
+    pub lp: Address,
+    pub payer: Address,
+    /// New default count for this specific pair.
+    pub pair_count: u32,
+}
+
+/// Payload of the `backstop_topup` event (Issue #827).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackstopTopUp {
+    pub from: Address,
+    pub amount: i128,
+    /// New backstop balance after the top-up.
+    pub backstop_balance: i128,
 }
 
 #[contract]
@@ -638,6 +743,378 @@ impl InsurancePool {
         }
     }
 
+    // ── Issue #826: solvency circuit breaker ─────────────────────────────
+    //
+    // Governance can set a minimum pool reserve ratio (balance vs the
+    // per-claim coverage cap). When the pool's actual ratio falls below the
+    // threshold, new claim payouts are paused and the breaker trips (sticky
+    // until a governance reset). Enrollments and premium deposits continue
+    // regardless, so the pool can recover without forcing LPs out.
+
+    /// Set the minimum reserve ratio (in bps, 0..=10_000) below which new
+    /// claim payouts are paused. `0` disables the breaker. Admin-only.
+    pub fn set_min_reserve_ratio_bps(env: Env, bps: u32) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        if bps > 10_000 {
+            return Err(InsuranceError::InvalidReserveRatio);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinReserveRatioBps, &bps);
+        env.events().publish((symbol_short!("resv_min"),), bps);
+        Ok(())
+    }
+
+    /// The configured minimum reserve ratio (bps). `0` means the breaker is
+    /// disabled.
+    pub fn get_min_reserve_ratio_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinReserveRatioBps)
+            .unwrap_or(0)
+    }
+
+    /// Current pool reserve ratio in bps: total claimable reserve (liquid
+    /// balance + capital backstop) over the per-claim coverage cap.
+    pub fn get_reserve_ratio_bps(env: Env) -> u32 {
+        let coverage = Self::get_coverage(env.clone());
+        if coverage <= 0 {
+            return 0;
+        }
+        let reserve = Self::get_total_reserve(env);
+        let ratio = reserve
+            .saturating_mul(10_000)
+            .saturating_div(coverage);
+        ratio.min(u32::MAX as i128) as u32
+    }
+
+    /// Total claimable reserve: liquid claim balance plus capital backstop.
+    pub fn get_total_reserve(env: Env) -> i128 {
+        let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
+        let backstop: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BackstopBalance)
+            .unwrap_or(0);
+        balance.saturating_add(backstop)
+    }
+
+    /// Whether the solvency circuit breaker is currently open (payouts
+    /// paused). Sticky until a governance `reset_solvency_circuit`.
+    pub fn is_solvency_circuit_open(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::SolvencyCircuitOpenFlag)
+            .unwrap_or(false)
+    }
+
+    /// Resume claim payouts after a solvency circuit trip. Admin-only.
+    /// Emits `SolvencyCircuitReset`. No-op when the breaker is already clear.
+    pub fn reset_solvency_circuit(env: Env) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        if !env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::SolvencyCircuitOpenFlag)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let ratio_bps = Self::get_reserve_ratio_bps(env.clone());
+        let reserve = Self::get_total_reserve(env.clone());
+        env.storage()
+            .instance()
+            .remove(&DataKey::SolvencyCircuitOpenFlag);
+        env.events().publish(
+            (symbol_short!("solv_rst"),),
+            SolvencyCircuitReset {
+                ratio_bps,
+                reserve,
+            },
+        );
+        Ok(())
+    }
+
+    /// Reject a claim while the sticky solvency breaker is open. Called at
+    /// the top of `claim()` *before* any storage write so the rejection
+    /// never has state to roll back. No-op while the breaker is clear.
+    fn gate_solvency_circuit(env: &Env) {
+        let open: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::SolvencyCircuitOpenFlag)
+            .unwrap_or(false);
+        if open {
+            panic_with_error!(env, InsuranceError::SolvencyCircuitOpen);
+        }
+    }
+
+    /// After an otherwise-successful payout, check whether the pool's
+    /// reserve ratio has dropped to/below the governance-configured minimum
+    /// and, if so, trip the sticky breaker. Emits `SolvencyCircuitTripped`
+    /// exactly once per trip. This is deliberately the *last* step of a
+    /// `claim()` that is about to return `Ok` — in Soroban, a storage write
+    /// followed by a panic within the same invocation is rolled back (no
+    /// partial commit), so the trip flag could never persist if it were set
+    /// on the rejection path itself. A tripping `claim()` therefore pays its
+    /// final boundary payout and then pauses *subsequent* claims until
+    /// governance resets the breaker.
+    fn trip_circuit_if_breached(env: &Env) {
+        let min_bps = Self::get_min_reserve_ratio_bps(env.clone());
+        if min_bps == 0 {
+            return;
+        }
+        let already_open: bool = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::SolvencyCircuitOpenFlag)
+            .unwrap_or(false);
+        if already_open {
+            return;
+        }
+        let ratio_bps = Self::get_reserve_ratio_bps(env.clone());
+        if ratio_bps >= min_bps {
+            return;
+        }
+        let reserve = Self::get_total_reserve(env.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::SolvencyCircuitOpenFlag, &true);
+        env.events().publish(
+            (symbol_short!("solv_trip"),),
+            SolvencyCircuitTripped {
+                ratio_bps,
+                reserve,
+            },
+        );
+    }
+
+    // ── Issue #827: protocol capital backstop ────────────────────────────
+    //
+    // A separate accounting balance held as a capital backstop, funded by a
+    // configurable share of each premium deposit and/or governance-led
+    // top-ups. Claims draw from liquid balance first, then the backstop.
+
+    /// Set the share (bps) of each premium deposit diverted to the backstop
+    /// fund. `0` disables automatic backstop contributions. Admin-only.
+    pub fn set_backstop_funding_bps(env: Env, bps: u32) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        if bps > 10_000 {
+            return Err(InsuranceError::InvalidReserveRatio);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::BackstopFundingBps, &bps);
+        env.events().publish((symbol_short!("back_bps"),), bps);
+        Ok(())
+    }
+
+    /// The configured premium-to-backstop share (bps). `0` = disabled.
+    pub fn get_backstop_funding_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BackstopFundingBps)
+            .unwrap_or(0)
+    }
+
+    /// The current capital backstop balance.
+    pub fn get_backstop_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BackstopBalance)
+            .unwrap_or(0)
+    }
+
+    /// Top up the capital backstop. `from` transfers `amount` tokens to the
+    /// pool; the credited amount is booked to the backstop, not the liquid
+    /// claim balance. Admin authorizes the ordering; `from` authorizes the
+    /// transfer. Emits `BackstopTopUp`.
+    pub fn top_up_backstop(
+        env: Env,
+        from: Address,
+        amount: i128,
+    ) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        if amount <= 0 {
+            return Err(InsuranceError::InvalidBackstopAmount);
+        }
+        from.require_auth();
+
+        let backstop: i128 = Self::get_backstop_balance(env.clone());
+        let new_backstop = backstop
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ArithmeticOverflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::BackstopBalance, &new_backstop);
+
+        let token = Self::get_token_client(&env);
+        token.transfer(
+            &from,                             // from (caller)
+            &env.current_contract_address(),   // to (this contract)
+            &amount,
+        );
+
+        env.events().publish(
+            (symbol_short!("back_top"), from.clone()),
+            BackstopTopUp {
+                from,
+                amount,
+                backstop_balance: new_backstop,
+            },
+        );
+        Ok(())
+    }
+
+    // ── Issue #828: claim evidence & review window ───────────────────────
+    //
+    // A lightweight on-chain evidence-hash can be attached to any claim at
+    // any time (advisory: auditable after the fact). When governance enables
+    // a review window, payout is additionally gated on evidence having been
+    // submitted and the window having elapsed — opt-in per risk tier, so the
+    // automatic flow is unchanged while the gate is off.
+
+    /// Attach an evidence hash (32 bytes, e.g. an IPFS CID / doc digest) to
+    /// an invoice. Admin-only. Overwrites any prior evidence for the invoice
+    /// and records the submission timestamp. Emits `ClaimEvidence`.
+    pub fn submit_claim_evidence(
+        env: Env,
+        invoice_id: u64,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        let evidence = ClaimEvidence {
+            evidence_hash: evidence_hash.clone(),
+            submitted_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClaimEvidence(invoice_id), &evidence.clone());
+        env.events()
+            .publish((symbol_short!("evidence"), invoice_id), evidence);
+        Ok(())
+    }
+
+    /// The evidence hash and submission timestamp recorded for an invoice,
+    /// if any.
+    pub fn get_claim_evidence(env: Env, invoice_id: u64) -> Option<ClaimEvidence> {
+        env.storage().persistent().get(&DataKey::ClaimEvidence(invoice_id))
+    }
+
+    /// Set the review window (seconds) that gated claims must sit in after
+    /// evidence submission before payout. `0` disables the gate (automatic
+    /// flow). Admin-only.
+    pub fn set_review_window_seconds(env: Env, seconds: u64) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::ReviewWindowSeconds, &seconds);
+        env.events().publish((symbol_short!("rev_wnd"),), seconds);
+        Ok(())
+    }
+
+    /// The configured review window (seconds). `0` = gate disabled.
+    pub fn get_review_window_seconds(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReviewWindowSeconds)
+            .unwrap_or(0)
+    }
+
+    /// Evaluate the review-window gate on a claim. No-op while the window is
+    /// disabled. When enabled, requires evidence to have been submitted and
+    /// the window to have elapsed since submission.
+    fn enforce_claim_review_gate(env: &Env, invoice_id: u64) {
+        let window_seconds = Self::get_review_window_seconds(env.clone());
+        if window_seconds == 0 {
+            return;
+        }
+        let evidence: ClaimEvidence = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::ClaimEvidence(invoice_id))
+        {
+            Some(e) => e,
+            None => panic_with_error!(env, InsuranceError::EvidenceRequired),
+        };
+        let now = env.ledger().timestamp();
+        let payout_eta = evidence
+            .submitted_at
+            .checked_add(window_seconds)
+            .unwrap_or(u64::MAX);
+        if now < payout_eta {
+            panic_with_error!(env, InsuranceError::ReviewWindowNotElapsed);
+        }
+    }
+
+    // ── Issue #829: per-pair default tracking (collusion heuristic) ──────
+    //
+    // Defaults are tracked per (lp, payer) pair so an off-chain monitor can
+    // detect concentration: a payer responsible for a disproportionately
+    // large share of one LP's defaults is a collusion signal. On-chain data
+    // is intentionally kept raw and simple — computed/viewed off-chain.
+
+    /// Record a confirmed default for an (lp, payer) pair. Also bumps the
+    /// LP-wide and pool-wide default counters (keeps Issue #528's rollups in
+    /// sync). Admin-only. Emits `PairDefaultRecorded`.
+    pub fn record_pair_default(
+        env: Env,
+        lp: Address,
+        payer: Address,
+    ) -> Result<(), InsuranceError> {
+        Self::require_admin(&env);
+
+        Self::increment_default_count(env.clone(), lp.clone())?;
+
+        let pair_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PairDefaultCount(lp.clone(), payer.clone()))
+            .unwrap_or(0);
+        let new_pair_count = pair_count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(
+                &DataKey::PairDefaultCount(lp.clone(), payer.clone()),
+                &new_pair_count,
+            );
+
+        env.events().publish(
+            (symbol_short!("pair_def"), lp.clone(), payer.clone()),
+            PairDefaultRecorded {
+                lp,
+                payer,
+                pair_count: new_pair_count,
+            },
+        );
+        Ok(())
+    }
+
+    /// Total confirmed defaults for a specific (lp, payer) pair.
+    pub fn get_pair_default_count(env: Env, lp: Address, payer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PairDefaultCount(lp, payer))
+            .unwrap_or(0)
+    }
+
+    /// Collusion heuristic for a (lp, payer) pair, computed on-chain for
+    /// cheap queries: a pair is flagged when it has accumulated at least
+    /// `MIN_PAIR_DEFAULTS_TO_FLAG` defaults AND those defaults make up at
+    /// least `COLLUSION_PAIR_SHARE_FLAG_BPS` of the LP's total defaults.
+    pub fn get_pair_collusion_flag(env: Env, lp: Address, payer: Address) -> bool {
+        let pair_count = Self::get_pair_default_count(env.clone(), lp.clone(), payer);
+        if pair_count < MIN_PAIR_DEFAULTS_TO_FLAG {
+            return false;
+        }
+        let lp_defaults = Self::get_default_count(env, lp);
+        if lp_defaults == 0 {
+            return false;
+        }
+        let pair_share_bps = (pair_count as u64).saturating_mul(10_000) / (lp_defaults as u64);
+        pair_share_bps >= COLLUSION_PAIR_SHARE_FLAG_BPS as u64
+    }
+
     /// Mark `lp` as enrolled, maintaining `EnrolledCount` — a no-op if
     /// already enrolled, so repeated `enroll()`/`deposit_premium()` calls
     /// don't inflate the count.
@@ -727,9 +1204,17 @@ impl InsurancePoolInterface for InsurancePool {
             .persistent()
             .set(&DataKey::Premiums(lp.clone()), &new_premium);
 
+        // Issue #827: divert a governance-configured share of the premium to
+        // the capital backstop; the rest is booked to the liquid balance.
+        let funding_bps: u32 = Self::get_backstop_funding_bps(env.clone());
+        let backstop_share = (amount as i128)
+            .saturating_mul(funding_bps as i128)
+            .saturating_div(10_000);
+        let liquid_share = amount.saturating_sub(backstop_share);
+
         let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
         let new_balance = balance
-            .checked_add(amount)
+            .checked_add(liquid_share)
             .unwrap_or_else(|| panic_with_error!(&env, InsuranceError::ArithmeticOverflow));
 
         // Enforce the optional balance cap.
@@ -746,6 +1231,24 @@ impl InsurancePoolInterface for InsurancePool {
         env.storage()
             .instance()
             .set(&DataKey::Balance, &new_balance);
+
+        if backstop_share > 0 {
+            let backstop: i128 = Self::get_backstop_balance(env.clone());
+            let new_backstop = backstop.checked_add(backstop_share).unwrap_or_else(|| {
+                panic_with_error!(&env, InsuranceError::ArithmeticOverflow)
+            });
+            env.storage()
+                .instance()
+                .set(&DataKey::BackstopBalance, &new_backstop);
+            env.events().publish(
+                (symbol_short!("back_top"), lp.clone()),
+                BackstopTopUp {
+                    from: lp.clone(),
+                    amount: backstop_share,
+                    backstop_balance: new_backstop,
+                },
+            );
+        }
 
         // Transfer tokens from LP to pool (checks-effects-interactions pattern).
         // State changes above must complete before this external call.
@@ -768,39 +1271,67 @@ impl InsurancePoolInterface for InsurancePool {
             panic_with_error!(&env, InsuranceError::AlreadyClaimed);
         }
 
-        let balance: i128 = env.storage().instance().get(&DataKey::Balance).unwrap_or(0);
-        if balance <= 0 {
+        // Issue #826: pause new payouts while the solvency circuit breaker is
+        // open. Run before any storage write so the rejection has no state to
+        // roll back.
+        Self::gate_solvency_circuit(&env);
+
+        // Issue #828: opt-in review window — require evidence + elapsed window
+        // before payout when the gate is enabled.
+        Self::enforce_claim_review_gate(&env, invoice_id);
+
+        // Issue #827: available reserve is the liquid balance plus the capital
+        // backstop; claims draw from liquid first, then the backstop.
+        let balance: i128 = Self::get_pool_balance(env.clone());
+        let backstop: i128 = Self::get_backstop_balance(env.clone());
+        let available = balance.saturating_add(backstop);
+        if available > 0 {
+            // Use tiered coverage based on LP's premiums paid (Issue #528).
+            let coverage: i128 = Self::get_tiered_coverage(env.clone(), lp.clone());
+            // Payout: tiered coverage cap, bounded by available reserve.
+            let payout = if coverage < available {
+                coverage
+            } else {
+                available
+            };
+
+            // Draw from liquid balance first, then the backstop.
+            let from_balance = if payout < balance { payout } else { balance };
+            let from_backstop = payout.saturating_sub(from_balance);
+
+            // Checks-effects-interactions: update state before external call.
+            env.storage()
+                .instance()
+                .set(&DataKey::Balance, &(balance - from_balance));
+            if from_backstop > 0 {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::BackstopBalance, &(backstop - from_backstop));
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::Claimed(invoice_id), &true);
+
+            // Transfer tokens from pool to LP (Issue #527).
+            let token = Self::get_token_client(&env);
+            token.transfer(
+                &env.current_contract_address(), // from (this contract)
+                &lp,                             // to
+                &payout,
+            );
+
+            env.events()
+                .publish((symbol_short!("claimed"), invoice_id), payout);
+
+            // Issue #826: trip the sticky breaker if this payout dropped the
+            // reserve ratio to/below the minimum. Must run last, before this
+            // invocation returns Ok, so the flag write persists (a write
+            // followed by a panic would be rolled back entirely).
+            Self::trip_circuit_if_breached(&env);
+            payout
+        } else {
             panic_with_error!(&env, InsuranceError::PoolEmpty);
         }
-
-        // Use tiered coverage based on LP's premiums paid (Issue #528).
-        let coverage: i128 = Self::get_tiered_coverage(env.clone(), lp.clone());
-        // Payout: tiered coverage cap, bounded by available balance.
-        let payout = if coverage < balance {
-            coverage
-        } else {
-            balance
-        };
-
-        // Checks-effects-interactions: update state before external call.
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance, &(balance - payout));
-        env.storage()
-            .persistent()
-            .set(&DataKey::Claimed(invoice_id), &true);
-
-        // Transfer tokens from pool to LP (Issue #527).
-        let token = Self::get_token_client(&env);
-        token.transfer(
-            &env.current_contract_address(), // from (this contract)
-            &lp,                             // to
-            &payout,
-        );
-
-        env.events()
-            .publish((symbol_short!("claimed"), invoice_id), payout);
-        payout
     }
 
     fn get_pool_balance(env: Env) -> i128 {

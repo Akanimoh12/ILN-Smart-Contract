@@ -30,6 +30,31 @@ generated for cross-contract calls):
 Auxiliary views on the contract: `get_premiums_paid(lp)`, `get_coverage()`,
 `is_claimed(invoice_id)`, plus `initialize(admin, coverage)`.
 
+The five issues shipped with this iteration add the following **non-interface**
+methods on the full `InsurancePoolClient` (the `InsurancePoolInterface` and its
+`INSURANCE_INTERFACE_VERSION = 1` are deliberately **unchanged**, so existing
+`invoice_liquidity` integration keeps working):
+
+| Method | Auth | Issue | Description |
+|--------|------|-------|-------------|
+| `set_min_reserve_ratio_bps(bps)` | admin | #826 | Set minimum pool reserve ratio (bps, 0..=10_000) below which claims pause. `0` disables the breaker. |
+| `get_min_reserve_ratio_bps() -> u32` | — | #826 | Current breaker threshold (bps). |
+| `get_reserve_ratio_bps() -> u32` | — | #826 | Current reserve ratio: `(balance + backstop) / coverage` in bps. |
+| `get_total_reserve() -> i128` | — | #826/#827 | Liquid balance + capital backstop. |
+| `is_solvency_circuit_open() -> bool` | — | #826 | Whether the sticky breaker is currently open. |
+| `reset_solvency_circuit()` | admin | #826 | Clear the breaker trip and emit `SolvencyCircuitReset`. |
+| `set_backstop_funding_bps(bps)` | admin | #827 | Share (bps) of each premium diverted to the backstop. `0` disables. |
+| `get_backstop_funding_bps() -> u32` | — | #827 | Config backstop funding share (bps). |
+| `get_backstop_balance() -> i128` | — | #827 | Current backstop balance. |
+| `top_up_backstop(from, amount)` | admin | #827 | Book `amount` from `from` into the backstop (real token transfer). |
+| `submit_claim_evidence(invoice_id, hash)` | admin | #828 | Attach a 32-byte evidence hash to a claim; records timestamp. |
+| `get_claim_evidence(invoice_id) -> Option<ClaimEvidence>` | — | #828 | Evidence hash + submission time for an invoice. |
+| `set_review_window_seconds(secs)` | admin | #828 | Require evidence + this delay after submission before payout. `0` disables. |
+| `get_review_window_seconds() -> u64` | — | #828 | Config review window (seconds). |
+| `record_pair_default(lp, payer)` | admin | #829 | Record a default against a specific (lp, payer) pair; bumps LP/pool rollups. |
+| `get_pair_default_count(lp, payer) -> u32` | — | #829 | Raw per-pair default count. |
+| `get_pair_collusion_flag(lp, payer) -> bool` | — | #829 | Heuristic: pair flagged when ≥ `MIN_PAIR_DEFAULTS_TO_FLAG` defaults and ≥ 50% of the LP's defaults concentrate on one payer. |
+
 ### Timelocked admin actions (Issue #542)
 
 Coverage cap changes and admin transfers are sensitive to LPs, so they are
@@ -61,12 +86,95 @@ implementation of the interface with intentionally simplified economics:
   `deposit_premium` moves real SAC tokens from the LP into the pool and
   records the amount as pool balance; `claim` transfers real tokens back out.
 - **Tiered coverage cap (Issue #528).** `claim` pays
-  `min(tiered_coverage(lp), pool_balance)`, where `tiered_coverage(lp)` scales
-  the configured flat `coverage` cap by how much the LP has paid in premiums
-  over the pool's lifetime — see
+  `min(tiered_coverage(lp), available_reserve)`, where `tiered_coverage(lp)`
+  scales the configured flat `coverage` cap by how much the LP has paid in
+  premiums over the pool's lifetime — see
   [Tiered coverage boundaries](#tiered-coverage-boundaries-issue-528) below.
+  `available_reserve` is the liquid balance **plus** the capital backstop
+  (Issue #827), drawn liquid-first then from the backstop.
 - **Idempotency & auth.** Each `invoice_id` can be claimed once; `claim`
   requires the configured admin (the liquidity contract in production).
+
+### Solvency circuit breaker (Issue #826)
+
+Governance sets a minimum reserve ratio (`MinReserveRatioBps`, default `0` =
+disabled) against the per-claim coverage cap. Each claim sequence:
+
+- **Gate:** if the sticky `SolvencyCircuitOpenFlag` is already open, `claim`
+  panics with `SolvencyCircuitOpen` *before* any storage write (rejections
+  never have state to roll back).
+- **Trip:** a payout that leaves the pool at/below the threshold — measured as
+  `(liquid_balance + backstop) / coverage` — trips the breaker *after* the
+  payout completes. This ordering is deliberate: in Soroban, a storage write
+  followed by a panic in the same invocation is rolled back (no partial
+  commit), so the flag could never persist if it were set on a rejection path.
+  The tripping claim therefore pays out its final bound payout (emits
+  `claimed`), then emits `SolvencyCircuitTripped { ratio_bps, reserve }` and
+  sets the sticky flag.
+- **Sticky pause:** while the flag is open, **all** subsequent claims are
+  rejected with `SolvencyCircuitOpen` — even if a later deposit restored the
+  ratio — until governance calls `reset_solvency_circuit()` (emits
+  `SolvencyCircuitReset`). This sticky design intentionally requires an
+  explicit human resume after a solvency event.
+- **Enrollments and premium deposits are never blocked** by the breaker, so
+  the pool can be recapitalized while payouts are paused.
+
+The breaker is purely additive and off by default, so pools that never arm it
+behave exactly as before. Note that because `claim()` derives payout from
+tiered coverage capped by available reserve, the breaker is a *policy* guard
+for LPs/auditors — the protocol's own solvency invariant (never overpay) was
+already guaranteed by the `min()` bounding.
+
+### Capital backstop (Issue #827)
+
+The pool holds a second accounting balance, the **backstop**, separate from the
+liquid claim `Balance`:
+
+- **Funding sources**: a governance-led `top_up_backstop(from, amount)` (real
+  token transfer from `from`), plus an optional automatic share of every
+  premium deposit (`set_backstop_funding_bps`, default `0` = disabled).
+- **Payout order**: `claim()` computes `payout = min(tiered_coverage(lp),
+  liquid_balance + backstop)` and draws liquid balance **first**, then the
+  backstop. The claim event payload remains the total payout; the internal
+  split is observable via `get_backstop_balance()` after the claim.
+- **Semantics**: the backstop is a reserve buffer, not LP-owned deposits —
+  it extends the pool's claim-paying capacity beyond the liquid premium pool.
+  The chosen approach and the rejected alternatives are recorded in
+  [ADR-013](adr/ADR-013-capital-backstop.md).
+
+### Claim evidence & review window (Issue #828)
+
+Two opt-in mechanisms around claims, both **disabled by default** so the
+automatic flow is unchanged:
+
+- **Evidence attachment (advisory, always available):**
+  `submit_claim_evidence(invoice_id, hash)` records a 32-byte digest (e.g. an
+  IPFS CID or document hash) plus a ledger timestamp, queryable via
+  `get_claim_evidence()`. This is purely additive — an auditable trail of
+  what documentation backs a claim, attachable before or after payout.
+- **Review-window gate (opt-in per risk tier):** when governance sets
+  `set_review_window_seconds(n) > 0`, `claim()` additionally requires that
+  evidence was submitted and that `timestamp >= submitted_at + n` before
+  paying out. Without evidence it panics `EvidenceRequired`; too early it
+  panics `ReviewWindowNotElapsed`. Because `invoice_liquidity` calls `claim`
+  via `try_claim` and treats failure as `compensated: false`, enabling the
+  gate for a risk tier simply defers compensation until a follow-up payout
+  invocation after the window — compatible with the existing graceful
+  degradation, no timelock-queue changes needed.
+
+### Per-pair default tracking & collusion heuristic (Issue #829)
+
+`record_pair_default(lp, payer)` counts defaults per (lp, payer) pair while
+keeping the existing per-LP and pool-wide counters (Issue #528) in sync.
+The raw `get_pair_default_count(lp, payer)` is surfaced for off-chain
+monitoring. `get_pair_collusion_flag(lp, payer)` applies the documented
+heuristic on-chain: a pair is flagged once it has at least
+`MIN_PAIR_DEFAULTS_TO_FLAG` (3) defaults *and* those defaults represent at
+least `COLLUSION_PAIR_SHARE_FLAG_BPS` (50%) of the LP's total defaults —
+i.e. one payer absorbing a disproportionate share of a single LP's losses.
+The flag is deliberately conservative (threshold + concentration) to avoid
+false-positive alerts while still catching serial-collusion patterns; the
+design and its limits are discussed in [ADR-014](adr/ADR-014-pair-default-tracking.md).
 
 The crate's test suite (`cargo test -p insurance_pool`) covers initialization,
 enrollment, premium accumulation, tiered and balance-capped payouts,
@@ -417,6 +525,19 @@ console.log(`Claim filed for invoice ${invoiceId}: payout ${payout} stroops`);
 - ~~Real SAC token custody for premiums and payouts.~~ Done (Issue #527).
 - ~~Risk-priced premiums and coverage (vs. flat cap).~~ Done (Issue #528) —
   see [Tiered coverage boundaries](#tiered-coverage-boundaries-issue-528).
+- ~~Solvency circuit breaker.~~ Done (Issue #826) — a governance-configurable
+  minimum reserve ratio pauses new claims when breached and requires an
+  explicit `reset_solvency_circuit` to resume; enrollments and premiums are
+  never blocked.
+- ~~Capital backstop fund.~~ Done (Issue #827) — protocol-owned backstop
+  balance funded by a configurable premium share and/or governance top-ups,
+  drawn after liquid balance on claims; see [ADR-013](adr/ADR-013-capital-backstop.md).
+- ~~Claim evidence hashing + review window.~~ Done (Issue #828) — advisory
+  evidence attachment always available; a review-wave gate is opt-in per risk
+  tier via `set_review_window_seconds`.
+- ~~Per-pair default tracking for collusion detection.~~ Done (Issue #829) —
+  raw per-(lp, payer) counters plus an on-chain heuristic flag; see
+  [ADR-014](adr/ADR-014-pair-default-tracking.md).
 - Pool solvency guards and payout prioritization across simultaneous defaults
   — tier eligibility (above) is based on premiums paid only and doesn't yet
   weight remaining pool balance, so a pool near-depleted by prior claims could
@@ -426,6 +547,8 @@ console.log(`Claim filed for invoice ${invoiceId}: payout ${payout} stroops`);
   #662)](#aggregate-exposure-invariant-issue-662) for the chosen best-effort
   policy and stress-test coverage of this exact scenario — a real
   reservation/allocation system that bounds aggregate exposure remains a
-  follow-up, not attempted here.
+  follow-up, not attempted here. The new solvency breaker (Issue #826) is a
+  *complementary* guard: it pauses payouts when the reserve ratio is too thin,
+  rather than changing payout prioritization.
 - Governance parameters (premium schedule, coverage ratio).
 - End-to-end integration tests across `invoice_liquidity` ⇄ `insurance_pool`.
