@@ -1236,3 +1236,255 @@ fn insurance_pool_handles_sequential_mass_enrollment_and_claims() {
         "pool should have processed at least some claims"
     );
 }
+
+// ── Issue #826: solvency circuit breaker tests ─────────────────────────
+
+#[test]
+fn solvency_circuit_trips_and_blocks_claim_but_not_premiums() {
+    let s = setup();
+
+    // Deposit a tiny premium (tiny reserve relative to the coverage cap).
+    s.token_admin.mint(&s.lp, &100);
+    s.client.deposit_premium(&s.lp, &100);
+
+    // Arm the breaker at 50% of the coverage cap.
+    s.client.set_min_reserve_ratio_bps(&5000);
+    assert_eq!(s.client.get_min_reserve_ratio_bps(), 5000);
+
+    // Reserve ratio is ~0 < 5000 bps. The breaker trips durably on the
+    // boundary payout (a Soroban write followed by a panic on the same
+    // invocation would be rolled back), so this claim pays out and then the
+    // flag persists.
+    let payout = s.client.claim(&1, &s.lp);
+    assert!(payout > 0);
+    assert!(s.client.is_solvency_circuit_open());
+    assert_eq!(s.client.get_reserve_ratio_bps(), 0);
+    assert!(s.client.is_claimed(&1));
+
+    // Enrollments and premium deposits must continue while the circuit is open.
+    s.token_admin.mint(&s.lp, &500);
+    s.client.deposit_premium(&s.lp, &500);
+    assert_eq!(s.client.get_pool_balance(), 500);
+    assert!(s.client.is_enrolled(&s.lp));
+
+    // Still tripped -> new payouts are paused.
+    let res2 = s.client.try_claim(&2, &s.lp);
+    assert_eq!(
+        res2,
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::SolvencyCircuitOpen)))
+    );
+}
+
+#[test]
+fn solvency_circuit_reset_resumes_payouts_after_reserve_restored() {
+    let s = setup();
+
+    // Tiny reserve -> the tripping claim pays out and opens the breaker.
+    s.token_admin.mint(&s.lp, &100);
+    s.client.deposit_premium(&s.lp, &100);
+    s.client.set_min_reserve_ratio_bps(&5000);
+    let payout = s.client.claim(&1, &s.lp);
+    assert!(payout > 0);
+    assert!(s.client.is_solvency_circuit_open());
+
+    // Rebuild the reserve above the threshold.
+    s.token_admin.mint(&s.lp, &COVERAGE);
+    s.client.deposit_premium(&s.lp, &COVERAGE);
+
+    // Governance can now resume; the healthy ratio must not re-trip.
+    s.client.reset_solvency_circuit();
+    assert!(!s.client.is_solvency_circuit_open());
+
+    // A new claim now succeeds (premiums > 50% of coverage -> 150% tier,
+    // bounded by the available reserve). A tripped invoice stays claimed.
+    let payout2 = s.client.claim(&2, &s.lp);
+    assert!(payout2 > 0);
+    assert!(s.client.is_claimed(&2));
+    assert!(!s.client.is_solvency_circuit_open());
+}
+
+#[test]
+fn solvency_circuit_no_false_trip_on_healthy_reserve() {
+    let s = setup();
+
+    // Reserve well above the threshold.
+    s.token_admin.mint(&s.lp, &(COVERAGE * 3));
+    s.client.deposit_premium(&s.lp, &(COVERAGE * 3));
+
+    s.client.set_min_reserve_ratio_bps(&1000); // 10% threshold
+    assert!(!s.client.is_solvency_circuit_open());
+
+    // A claim at healthy reserve must succeed without tripping.
+    let payout = s.client.claim(&1, &s.lp);
+    assert_eq!(payout, (COVERAGE * 150) / 100);
+    assert!(!s.client.is_solvency_circuit_open());
+
+    // Threshold above 100% is rejected.
+    let res = s.client.try_set_min_reserve_ratio_bps(&10_001);
+    assert_eq!(res, Err(Ok(InsuranceError::InvalidReserveRatio)));
+}
+
+// ── Issue #827: capital backstop tests ─────────────────────────────────
+
+#[test]
+fn backstop_funding_split_books_share_aside_from_claim_balance() {
+    let s = setup();
+
+    s.client.set_backstop_funding_bps(&1000); // 10% of premiums to backstop
+    assert_eq!(s.client.get_backstop_funding_bps(), 1000);
+
+    s.token_admin.mint(&s.lp, &1000);
+    s.client.deposit_premium(&s.lp, &1000);
+
+    assert_eq!(s.client.get_backstop_balance(), 100);
+    assert_eq!(s.client.get_pool_balance(), 900);
+    // Full premium is still credited for tiering / LP accounting.
+    assert_eq!(s.client.get_premiums_paid(&s.lp), 1000);
+    // Whole amount transferred to the pool contract.
+    assert_eq!(s.token_client.balance(&s.client.address), 1000);
+}
+
+#[test]
+fn claim_draws_from_backstop_after_liquid_balance_exhausted() {
+    let s = setup();
+
+    s.token_admin.mint(&s.lp, &1000);
+    s.client.deposit_premium(&s.lp, &1000);
+    assert_eq!(s.client.get_pool_balance(), 1000);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+
+    // Protocol top-up seeds the backstop from a funded source.
+    let treasury = Address::generate(&s.env);
+    s.token_admin.mint(&treasury, &2000);
+    s.client.top_up_backstop(&treasury, &2000);
+    assert_eq!(s.client.get_backstop_balance(), 2000);
+    assert_eq!(s.token_client.balance(&s.client.address), 3000);
+
+    // Tier 1 coverage (50% of cap) for a 1,000-premium LP is far above the
+    // total reserve, so the payout draws both balances (liquid then backstop).
+    let payout = s.client.claim(&1, &s.lp);
+    assert_eq!(payout, 3000);
+    assert_eq!(s.client.get_pool_balance(), 0);
+    assert_eq!(s.client.get_backstop_balance(), 0);
+    assert!(s.client.is_claimed(&1));
+
+    // Tokens moved out accordingly.
+    assert_eq!(s.token_client.balance(&s.client.address), 0);
+    assert_eq!(s.token_client.balance(&s.lp), 3000);
+}
+
+#[test]
+fn backstop_top_up_rejects_non_positive_amount() {
+    let s = setup();
+    let res = s.client.try_top_up_backstop(&s.lp, &0);
+    assert_eq!(res, Err(Ok(InsuranceError::InvalidBackstopAmount)));
+    let res = s.client.try_top_up_backstop(&s.lp, &-1);
+    assert_eq!(res, Err(Ok(InsuranceError::InvalidBackstopAmount)));
+}
+
+// ── Issue #828: claim evidence & review window tests ──────────────────
+
+#[test]
+fn claim_evidence_is_recorded_and_queryable() {
+    let s = setup();
+
+    let hash = soroban_sdk::BytesN::from_array(&s.env, &[0xABu8; 32]);
+    s.client.submit_claim_evidence(&42, &hash);
+
+    let evidence = s.client.get_claim_evidence(&42);
+    assert_eq!(
+        evidence,
+        Some(ClaimEvidence {
+            evidence_hash: hash,
+            submitted_at: s.env.ledger().timestamp(),
+        })
+    );
+}
+
+#[test]
+fn review_window_requires_evidence_before_payout() {
+    let s = setup();
+    s.token_admin.mint(&s.lp, &COVERAGE);
+    s.client.deposit_premium(&s.lp, &COVERAGE);
+
+    s.client.set_review_window_seconds(&100);
+    assert_eq!(s.client.get_review_window_seconds(), 100);
+
+    // No evidence submitted yet -> payout rejected.
+    let res = s.client.try_claim(&1, &s.lp);
+    assert_eq!(
+        res,
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::EvidenceRequired)))
+    );
+
+    // Submit evidence; window starts ticking from submission.
+    let hash = soroban_sdk::BytesN::from_array(&s.env, &[0xCDu8; 32]);
+    s.client.submit_claim_evidence(&1, &hash);
+    let submitted_at = s.client.get_claim_evidence(&1).unwrap().submitted_at;
+
+    // Still within the window -> blocked.
+    let res = s.client.try_claim(&1, &s.lp);
+    assert_eq!(
+        res,
+        Err(Ok(soroban_sdk::Error::from(InsuranceError::ReviewWindowNotElapsed)))
+    );
+
+    // After the window elapses -> payout proceeds.
+    s.env.ledger().set_timestamp(submitted_at + 100);
+    let payout = s.client.claim(&1, &s.lp);
+    assert!(payout > 0);
+    assert!(s.client.is_claimed(&1));
+}
+
+#[test]
+fn review_window_disabled_by_default_keeps_automatic_flow() {
+    let s = setup();
+    s.token_admin.mint(&s.lp, &COVERAGE);
+    s.client.deposit_premium(&s.lp, &COVERAGE);
+
+    // Default window is 0 (disabled): claim without evidence succeeds.
+    assert_eq!(s.client.get_review_window_seconds(), 0);
+    let payout = s.client.claim(&1, &s.lp);
+    assert!(payout > 0);
+}
+
+// ── Issue #829: per-pair default tracking tests ───────────────────────
+
+#[test]
+fn pair_default_counts_are_tracked_and_rollups_kept_in_sync() {
+    let s = setup();
+    let payer = Address::generate(&s.env);
+
+    assert_eq!(s.client.get_pair_default_count(&s.lp, &payer), 0);
+
+    s.client.record_pair_default(&s.lp, &payer);
+    s.client.record_pair_default(&s.lp, &payer);
+    s.client.record_pair_default(&s.lp, &payer);
+
+    assert_eq!(s.client.get_pair_default_count(&s.lp, &payer), 3);
+    // LP-wide rollup stays consistent.
+    assert_eq!(s.client.get_default_count(&s.lp), 3);
+}
+
+#[test]
+fn pair_collusion_heuristic_flags_concentration_then_relaxes() {
+    let s = setup();
+    let payer_a = Address::generate(&s.env);
+    let payer_b = Address::generate(&s.env);
+
+    // 3 defaults all concentrated on payer_a -> flagged (100% share >= 50%).
+    for _ in 0..3 {
+        s.client.record_pair_default(&s.lp, &payer_a);
+    }
+    assert!(s.client.get_pair_collusion_flag(&s.lp, &payer_a));
+
+    // Dilute: 7 more defaults from payer_b brings payer_a to 30% of the LP's
+    // defaults -> concentration no longer enough to flag.
+    for _ in 0..7 {
+        s.client.record_pair_default(&s.lp, &payer_b);
+    }
+    assert_eq!(s.client.get_pair_default_count(&s.lp, &payer_a), 3);
+    assert_eq!(s.client.get_pair_default_count(&s.lp, &payer_b), 7);
+    assert_eq!(s.client.get_default_count(&s.lp), 10);
+    assert!(!s.client.get_pair_collusion_flag(&s.lp, &payer_a));
+}

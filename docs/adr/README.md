@@ -20,6 +20,8 @@ design choices so that future contributors understand *why* the system is built 
 | [ADR-010](ADR-010-oracle-registry.md) | Oracle Registry | Accepted |
 | [ADR-011](ADR-011-reputation-state-source-of-truth.md) | Reputation State Source of Truth | Accepted |
 | [ADR-012](ADR-012-governance-multisig-handoff.md) | Governance-to-Multisig Authority Handoff Plan | Accepted |
+| [ADR-013](ADR-013-capital-backstop.md) | Insurance Pool Capital Backstop | Accepted |
+| [ADR-014](ADR-014-pair-default-tracking.md) | Per-Pair Default Tracking for Collusion Detection | Accepted |
 
 ## Template
 
